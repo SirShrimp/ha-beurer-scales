@@ -82,6 +82,7 @@ def scale_advertisement(
     service_data: dict[str, bytes] | None = None,
     rssi: int = -60,
     raw: bytes | None = None,
+    source: str = "local",
 ) -> BluetoothServiceInfoBleak:
     """Build an advertisement as a BF450 sends it after waking up.
 
@@ -107,8 +108,8 @@ def scale_advertisement(
         manufacturer_data=advertisement.manufacturer_data,
         service_data=service_data,
         service_uuids=list(service_data),
-        source="local",
-        device=BLEDevice(address, local_name, {}),
+        source=source,
+        device=BLEDevice(address, local_name, {"source": source}),
         advertisement=advertisement,
         connectable=True,
         time=time.monotonic(),
@@ -117,13 +118,14 @@ def scale_advertisement(
     )
 
 
-def scan_response(scale: FakeScale) -> BluetoothServiceInfoBleak:
+def scan_response(scale: FakeScale, source: str = "local") -> BluetoothServiceInfoBleak:
     """The scale's scan response through an ESPHome proxy: the slot list now."""
     return scale_advertisement(
         address=scale.address,
         local_name=scale.local_name,
         service_data={SWAPPED_WEIGHT_SCALE_UUID: scale.listed_slots()},
         raw=scale.scan_response_data(),
+        source=source,
     )
 
 

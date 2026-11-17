@@ -5,13 +5,17 @@ own scale users afterwards: their slots are gone, and so are the deletions that
 were waiting for a wake.
 """
 
-from homeassistant.components.bluetooth import async_ble_device_from_address
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import HomeAssistant
 
 from .bond import async_remove_bond
-from .connection import async_hold_scale, async_open_session, async_wait_for_wake
+from .connection import (
+    async_ble_device_for_scale,
+    async_hold_scale,
+    async_open_session,
+    async_wait_for_wake,
+)
 from .const import CONF_MODEL, SUBENTRY_SCALE_USER
 from .coordinator import ScaleCoordinator
 from .protocol.errors import ScaleConnectionError
@@ -30,7 +34,7 @@ async def async_factory_reset_scale(hass: HomeAssistant, entry: ConfigEntry) -> 
     model = model_by_name(entry.data[CONF_MODEL])
     async with async_hold_scale(hass, address):
         await async_wait_for_wake(hass, address)
-        device = async_ble_device_from_address(hass, address, connectable=True)
+        device = async_ble_device_for_scale(hass, address)
         if device is None:
             raise ScaleConnectionError(f"no connectable Bluetooth path to {address}")
         async with async_open_session(hass, address, model, device=device) as session:

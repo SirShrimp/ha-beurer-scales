@@ -177,16 +177,22 @@ async def test_the_scale_options_offer_the_notification_on_by_default(
         result["flow_id"], {"next_step_id": "options"}
     )
     assert result["type"] is FlowResultType.FORM
-    [key] = result["data_schema"].schema
-    assert key == "notify_unrecognised"
-    assert key.default() is True
+    defaults = {key: key.default() for key in result["data_schema"].schema}
+    assert defaults == {"notify_unrecognised": True, "bluetooth_source": ""}
 
     result = await hass.config_entries.options.async_configure(
-        result["flow_id"], {"notify_unrecognised": False}
+        result["flow_id"],
+        {
+            "notify_unrecognised": False,
+            "bluetooth_source": "a0:f2:62:a4:52:42",
+        },
     )
     await hass.async_block_till_done()
     assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert entry.options == {"notify_unrecognised": False}
+    assert entry.options == {
+        "notify_unrecognised": False,
+        "bluetooth_source": "A0:F2:62:A4:52:42",
+    }
 
     await wake_scale(hass, fake_scale)
     await stay_awake(hass, freezer, fake_scale, 26)

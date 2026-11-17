@@ -60,6 +60,9 @@ from .connection import (
     async_let_paths_settle,
     async_open_session,
     async_scale_held,
+    bluetooth_source_for_address,
+    device_source,
+    is_remote_bluetooth_source,
 )
 from .discards import async_notify_discarded
 from .garmin_push import GarminPusher
@@ -425,6 +428,9 @@ class ScaleCoordinator:
 
     @callback
     def _async_on_advertisement(self, info: BluetoothServiceInfoBleak) -> None:
+        source = bluetooth_source_for_address(self.hass, self.address)
+        if source is not None and (info.source or "").upper() != source:
+            return
         wake = self.wakes.async_advertisement()
         self._async_log_advertisement(info, wake.elapsed)
         pending = pending_slots(info)
@@ -448,7 +454,22 @@ class ScaleCoordinator:
             or async_scale_held(self.hass, self.address)
         ):
             return
-        self._device = info.device if info.connectable else None
+        if info.connectable:
+            source = bluetooth_source_for_address(self.hass, self.address)
+            if source is not None:
+                self._device = info.device
+            else:
+                info_is_remote = is_remote_bluetooth_source(self.hass, info.source)
+                curr_source = (
+                    device_source(self._device) if self._device else None
+                )
+                curr_is_remote = (
+                    is_remote_bluetooth_source(self.hass, curr_source)
+                    if curr_source
+                    else False
+                )
+                if info_is_remote or not curr_is_remote:
+                    self._device = info.device
         if pending is None:
             return
         managed = self._managed_slots()
@@ -514,11 +535,17 @@ class ScaleCoordinator:
         if not order:
             return
         self._syncing = True
+        device = self._device
+        source = bluetooth_source_for_address(self.hass, self.address)
+        if device is not None and source is not None:
+            dev_source = device_source(device)
+            if dev_source and dev_source.strip().upper() != source:
+                device = None
         self.entry.async_create_background_task(
             self.hass,
             self._async_sync(
                 [managed[slot] for slot in order],
-                self._device,
+                device,
                 slot_appended=bool(fresh_slots),
             ),
             f"{DOMAIN} sync {self.address}",

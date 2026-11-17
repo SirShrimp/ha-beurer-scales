@@ -1,6 +1,7 @@
 """Config flow for adding a Beurer scale."""
 
 import asyncio
+import re
 from typing import Any
 
 import probatio
@@ -17,10 +18,11 @@ from homeassistant.config_entries import (
 )
 from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import callback
-from homeassistant.helpers.selector import BooleanSelector
+from homeassistant.helpers.selector import BooleanSelector, TextSelector
 
 from .connection import WakeTimeout
 from .const import (
+    CONF_BLUETOOTH_SOURCE,
     CONF_MODEL,
     CONF_NOTIFY_UNRECOGNISED,
     DEFAULT_NOTIFY_UNRECOGNISED,
@@ -181,24 +183,39 @@ class BeurerScalesOptionsFlow(OptionsFlow):
     async def async_step_options(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Choose whether HA notifies about unrecognised weigh-ins.
+        """Choose notification behavior and optionally pin a Bluetooth source.
 
         The coordinator reads the options when needed, so there is no reload.
         """
+        errors: dict[str, str] = {}
         if user_input is not None:
-            return self.async_create_entry(data=user_input)
+            source = user_input[CONF_BLUETOOTH_SOURCE].strip().upper()
+            if source and re.fullmatch(r"[0-9A-F]{2}(:[0-9A-F]{2}){5}", source) is None:
+                errors[CONF_BLUETOOTH_SOURCE] = "invalid_bluetooth_source"
+            else:
+                return self.async_create_entry(
+                    data={
+                        CONF_NOTIFY_UNRECOGNISED: user_input[CONF_NOTIFY_UNRECOGNISED],
+                        CONF_BLUETOOTH_SOURCE: source,
+                    }
+                )
         notify = self.config_entry.options.get(
             CONF_NOTIFY_UNRECOGNISED, DEFAULT_NOTIFY_UNRECOGNISED
         )
+        source = self.config_entry.options.get(CONF_BLUETOOTH_SOURCE, "")
         return self.async_show_form(
             step_id="options",
             data_schema=probatio.Schema(
                 {
                     probatio.Required(
                         CONF_NOTIFY_UNRECOGNISED, default=notify
-                    ): BooleanSelector()
+                    ): BooleanSelector(),
+                    probatio.Required(
+                        CONF_BLUETOOTH_SOURCE, default=source
+                    ): TextSelector(),
                 }
             ),
+            errors=errors,
         )
 
     async def async_step_factory_reset(

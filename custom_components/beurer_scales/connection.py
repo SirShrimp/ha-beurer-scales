@@ -13,23 +13,29 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime
 from functools import partial
+import logging
+import re
 
 from bleak.backends.device import BLEDevice
 
 from homeassistant.components.bluetooth import (
     BluetoothServiceInfoBleak,
     async_ble_device_from_address,
+    async_discovered_service_info,
     async_register_advertisement_callback,
 )
+from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_call_later
 
 from .bond import async_remove_bond
-from .const import DOMAIN
+from .const import CONF_BLUETOOTH_SOURCE, DOMAIN
 from .protocol.errors import ScaleConnectionError
 from .protocol.models import ScaleModel
 from .protocol.session import ScaleSession, open_session
+
+_LOGGER = logging.getLogger(__name__)
 
 # How long a flow waits for someone to step on the scale.
 WAKE_TIMEOUT = 180
@@ -37,6 +43,8 @@ WAKE_TIMEOUT = 180
 # Connecting at the very first one leaves HA a single path to choose from,
 # which in the field was a distant proxy whose link broke (#17).
 PATH_SETTLE = 1.5
+
+MAC_REGEX = re.compile(r"^([0-9A-F]{2}:){5}[0-9A-F]{2}$", re.IGNORECASE)
 
 
 _LOCKS = "scale_locks"
@@ -71,6 +79,105 @@ class WakeTimeout(Exception):
     """Nobody woke the scale in time."""
 
 
+def device_source(device: BLEDevice) -> str | None:
+    """Return the source identifier of a BLEDevice, if available."""
+    details = device.details
+    if isinstance(details, dict) and (source := details.get("source")):
+        return str(source)
+    return None
+
+
+def is_remote_bluetooth_source(hass: HomeAssistant, source: str | None) -> bool:
+    """Whether a Bluetooth source belongs to a remote scanner (e.g. ESPHome proxy)."""
+    if not source or (src := source.strip().lower()) == "local":
+        return False
+    try:
+        from homeassistant.components.bluetooth import async_scanner_by_source
+
+        scanner = async_scanner_by_source(hass, source)
+        if scanner is not None:
+            return getattr(scanner, "connector", None) is not None
+    except Exception:
+        pass
+    # If the scanner isn't found in manager or during test mocks,
+    # assume any non-local source represents a remote proxy.
+    return True
+
+
+def bluetooth_source_for_address(hass: HomeAssistant, address: str) -> str | None:
+    """Return the scale's pinned Bluetooth source, if configured."""
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        if entry.data.get(CONF_ADDRESS) == address:
+            source = entry.options.get(CONF_BLUETOOTH_SOURCE, "")
+            if isinstance(source, str) and (source := source.strip()):
+                return source.upper()
+            return None
+    return None
+
+
+def async_pin_bluetooth_source(
+    hass: HomeAssistant, address: str, device: BLEDevice | str
+) -> None:
+    """Pin the Bluetooth source for the scale if not already set."""
+    if isinstance(device, BLEDevice):
+        source = device_source(device)
+    else:
+        source = str(device)
+    if not source:
+        return
+    source = source.strip().upper()
+    if not MAC_REGEX.match(source):
+        return
+
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        if entry.data.get(CONF_ADDRESS) == address:
+            current = entry.options.get(CONF_BLUETOOTH_SOURCE, "")
+            if not isinstance(current, str) or not current.strip():
+                _LOGGER.info(
+                    "Pinning scale %s to Bluetooth source %s after successful session",
+                    address,
+                    source,
+                )
+                hass.config_entries.async_update_entry(
+                    entry,
+                    options={**entry.options, CONF_BLUETOOTH_SOURCE: source},
+                )
+
+
+def async_ble_device_for_scale(hass: HomeAssistant, address: str) -> BLEDevice | None:
+    """Return a connectable path for the scale, respecting its source option or preferring proxies."""
+    source = bluetooth_source_for_address(hass, address)
+    if source is not None:
+        return next(
+            (
+                info.device
+                for info in async_discovered_service_info(hass)
+                if info.address == address
+                and info.connectable
+                and (info.source or "").upper() == source
+            ),
+            None,
+        )
+
+    # When unpinned, find all connectable candidates and prefer remote/proxy paths over local
+    candidates = [
+        info
+        for info in async_discovered_service_info(hass)
+        if info.address == address and info.connectable
+    ]
+    if not candidates:
+        return async_ble_device_from_address(hass, address, connectable=True)
+
+    candidates.sort(
+        key=lambda info: (
+            1 if is_remote_bluetooth_source(hass, info.source) else 0,
+            info.rssi if info.rssi is not None else -999,
+        ),
+        reverse=True,
+    )
+    return candidates[0].device
+
+
 def _scale_lock(hass: HomeAssistant, address: str) -> asyncio.Lock:
     locks: dict[str, asyncio.Lock] = hass.data.setdefault(DOMAIN, {}).setdefault(
         _LOCKS, {}
@@ -98,11 +205,14 @@ async def async_wait_for_wake(
 
     A sleeping scale doesn't advertise, so any advertisement means it is awake.
     """
+    source = bluetooth_source_for_address(hass, address)
     woke: asyncio.Future[None] = hass.loop.create_future()
 
     @callback
-    def on_advertisement(_info: BluetoothServiceInfoBleak) -> None:
-        if not woke.done():
+    def on_advertisement(info: BluetoothServiceInfoBleak) -> None:
+        if not woke.done() and (
+            source is None or (info.source or "").upper() == source
+        ):
             woke.set_result(None)
 
     @callback
@@ -152,8 +262,13 @@ async def async_open_session(
     A failed bond (a stale one after a factory reset) is cleared on the proxy
     and the connect repeated once (#23).
     """
+    source = bluetooth_source_for_address(hass, address)
+    if device is not None and source is not None:
+        dev_source = device_source(device)
+        if dev_source and dev_source.strip().upper() != source:
+            device = None
     if device is None:
-        device = async_ble_device_from_address(hass, address, connectable=True)
+        device = async_ble_device_for_scale(hass, address)
     if device is None:
         raise ScaleConnectionError(f"no connectable Bluetooth path to {address}")
     opened = False
@@ -167,6 +282,8 @@ async def async_open_session(
         ) as session:
             opened = True
             yield session
+            # Auto-pin after a successful session if not already pinned
+            async_pin_bluetooth_source(hass, address, device)
     finally:
         if opened:
             _session_ends(hass)[address] = hass.loop.time()

@@ -39,10 +39,16 @@ def anna_weighs_in(scale: FakeScale) -> None:
     scale.weigh_in(2, FakeReading.from_capture(frames.READING_SLOT_2, at=local_now()))
 
 
-async def load_anna(hass: HomeAssistant) -> MockConfigEntry:
+async def load_anna(
+    hass: HomeAssistant, bluetooth_source: str | None = None
+) -> MockConfigEntry:
     """Start HA's side of Anna's scale afresh, as after a restart or reload."""
     entry = anna_scale()
     entry.add_to_hass(hass)
+    if bluetooth_source is not None:
+        hass.config_entries.async_update_entry(
+            entry, options={"bluetooth_source": bluetooth_source}
+        )
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
     return entry
@@ -145,6 +151,50 @@ async def test_a_late_appended_slot_syncs_after_the_wake_window(
 
     assert state(hass, WEIGHT).state == "78.4"
     assert scale.connection_attempts == 1
+
+
+async def test_pinned_source_ignores_other_bluetooth_paths(
+    hass: HomeAssistant,
+    anna_pending_before: FakeScale,
+) -> None:
+    """When pinned to A0, E4 scan responses cannot trigger a connection."""
+    scale = anna_pending_before
+    scale.users[2].stored_readings.clear()
+    await load_anna(hass, bluetooth_source="A0:F2:62:A4:52:42")
+    scale.wake()
+
+    await inject_advertisement(hass, scan_response(scale, source="E4:5F:01:57:25:D9"))
+    assert scale.connection_attempts == 0
+    await inject_advertisement(hass, scan_response(scale, source="A0:F2:62:A4:52:42"))
+
+    anna_weighs_in(scale)
+    scale.finish_weigh_in()
+    await inject_advertisement(hass, scan_response(scale, source="E4:5F:01:57:25:D9"))
+    assert scale.connection_attempts == 0
+    await inject_advertisement(hass, scan_response(scale, source="A0:F2:62:A4:52:42"))
+
+    assert state(hass, WEIGHT).state == "78.4"
+    assert scale.connection_attempts == 1
+
+
+async def test_successful_sync_auto_pins_bluetooth_source(
+    hass: HomeAssistant,
+    anna_pending_before: FakeScale,
+) -> None:
+    """A successful sync with no source pinned automatically pins that source."""
+    scale = anna_pending_before
+    scale.users[2].stored_readings.clear()
+    entry = await load_anna(hass)
+    assert entry.options.get("bluetooth_source") is None
+
+    scale.wake()
+    anna_weighs_in(scale)
+    scale.finish_weigh_in()
+    await inject_advertisement(hass, scan_response(scale, source="A0:F2:62:A4:52:42"))
+
+    assert state(hass, WEIGHT).state == "78.4"
+    assert scale.connection_attempts == 1
+    assert entry.options.get("bluetooth_source") == "A0:F2:62:A4:52:42"
 
 
 async def test_a_slot_list_merged_into_an_advertisement_is_not_trusted(

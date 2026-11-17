@@ -403,10 +403,15 @@
       "options": {
         "title": "Scale options",
         "data": {
-          "notify_unrecognised": "Notify about unrecognised weigh-ins"
+          "notify_unrecognised": "Notify about unrecognised weigh-ins",
+          "bluetooth_source": "Bluetooth source MAC (optional)"
         },
         "data_description": {
-          "notify_unrecognised": "Send a notification when someone steps on the scale and it recognises them as none of its scale users, so they can be added."
+          "notify_unrecognised": "Send a notification when someone steps on the scale and it recognises them as none of its scale users, so they can be added.",
+          "bluetooth_source": "Leave blank to let Home Assistant automatically pick and pin the Bluetooth adapter or ESPHome proxy on first successful connection. Enter a MAC address such as A0:F2:62:A4:52:42 to override or pin manually."
+        },
+        "error": {
+          "invalid_bluetooth_source": "Enter a MAC address in the format AA:BB:CC:DD:EE:FF, or leave it blank."
         }
       },
       "factory_reset": {

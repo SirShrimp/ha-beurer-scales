@@ -54,6 +54,7 @@ from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
 from .connection import (
+    _is_local_adapter,
     session_ended_at,
     session_ended_signal,
     async_hold_scale,
@@ -448,7 +449,22 @@ class ScaleCoordinator:
             or async_scale_held(self.hass, self.address)
         ):
             return
-        self._device = info.device if info.connectable else None
+        # Prefer a proxy device over the local adapter: the BLE bond for the
+        # SBF77 (and similar scales that need MITM pairing) lives only on the
+        # proxy.  When the latest advertisement came from a proxy, record it.
+        # When it came from the local adapter, keep whatever proxy device we
+        # already have -- only fall back to the local device if we have nothing.
+        if info.connectable:
+            if not _is_local_adapter(info):
+                # Proxy path: always prefer this.
+                self._device = info.device
+            elif self._device is None:
+                # Local path, no proxy seen yet: use as a last resort.
+                self._device = info.device
+        else:
+            # Non-connectable advertisement: only clear device if from proxy.
+            if not _is_local_adapter(info):
+                self._device = None
         if pending is None:
             return
         managed = self._managed_slots()

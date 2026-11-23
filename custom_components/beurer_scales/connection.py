@@ -43,63 +43,102 @@ WAKE_TIMEOUT = 180
 PATH_SETTLE = 1.5
 
 
-def _is_local_adapter(info: BluetoothServiceInfoBleak) -> bool:
-    """Return True when the advertisement came from the HA host's built-in
-    Bluetooth adapter (source == "local"), as opposed to a remote proxy.
+ESPHOME_DOMAIN = "esphome"
+BLUETOOTH_DOMAIN = "bluetooth"
 
-    ESPHome proxy sources identify themselves by their Bluetooth MAC address;
-    the local hci0 adapter uses the fixed string "local".  No device MACs are
-    hardcoded here.
+
+def esphome_proxy_sources(hass: HomeAssistant) -> set[str]:
+    """Return the set of known ESPHome Bluetooth proxy MAC addresses."""
+    sources: set[str] = set()
+    for entry in hass.config_entries.async_entries(ESPHOME_DOMAIN):
+        data = getattr(entry, "runtime_data", None)
+        info = getattr(data, "device_info", None)
+        if info is not None:
+            for mac in (info.bluetooth_mac_address, info.mac_address):
+                if mac:
+                    sources.add(mac.strip().upper())
+    return sources
+
+
+def is_local_source(hass: HomeAssistant | None, source: str | None) -> bool:
+    """Return True when source is a local Bluetooth adapter on the HA host."""
+    if not source:
+        return True
+    s = source.strip()
+    s_lower = s.lower()
+    # Common local adapter names/prefixes on Linux, Raspberry Pi, macOS, Windows, USB:
+    # "local", "hci0", "hci1", "usb...", "/dev/...", etc.
+    if (
+        s_lower == "local"
+        or s_lower.startswith("hci")
+        or s_lower.startswith("usb")
+        or s_lower.startswith("/dev/")
+    ):
+        return True
+    if hass is not None:
+        for entry in hass.config_entries.async_entries(BLUETOOTH_DOMAIN):
+            if entry.unique_id and s_lower == entry.unique_id.strip().lower():
+                return True
+            adapter = entry.data.get("adapter")
+            if adapter and s_lower == str(adapter).strip().lower():
+                return True
+    return False
+
+
+def is_proxy_source(hass: HomeAssistant, source: str | None) -> bool:
+    """Return True when source is an authorized remote proxy (e.g. ESPHome).
+
+    Local host adapters (hci*, local, usb) are strictly excluded.
+    If ESPHome proxies are registered in Home Assistant, the source
+    must match one of them.
     """
-    return (info.source or "").strip().lower() == "local"
+    if not source or is_local_source(hass, source):
+        return False
+    esphome_macs = esphome_proxy_sources(hass)
+    if esphome_macs:
+        return source.strip().upper() in esphome_macs
+    return True
+
+
+def _is_local_adapter(info: BluetoothServiceInfoBleak) -> bool:
+    """Return True when the advertisement came from a local Bluetooth adapter."""
+    return is_local_source(None, info.source)
+
+
+def _device_source(device: BLEDevice) -> str | None:
+    """The source string from a BLEDevice's details dict, if present."""
+    details = device.details
+    if isinstance(details, dict) and (source := details.get("source")):
+        return str(source)
+    return None
 
 
 @callback
 def async_ble_device_for_scale(
     hass: HomeAssistant, address: str
 ) -> BLEDevice | None:
-    """Return the best connectable BLEDevice for *address*, preferring a
-    remote ESPHome proxy over the local adapter.
+    """Return the best connectable BLEDevice for *address*, strictly requiring a
+    remote proxy over any local adapter.
 
-    When the scale is reachable through at least one proxy, the local adapter's
-    path is ignored, because only the proxy holds the BLE bond for the SBF77.
-    If no proxy path exists the local path is returned as a fallback (edge case:
-    proxy offline) with a warning, so other scales that don't need bonding
-    still work.
+    For scales like the SBF77 that require bonding on an ESPHome proxy, the local
+    adapter's path (hci*, local, usb) is strictly ignored to prevent triggering
+    PIN prompts or invalidating the existing bond.
     """
-    # Gather every currently-known connectable path for this address.
-    proxy_device: BLEDevice | None = None
-    local_device: BLEDevice | None = None
-
     for scanner_device in async_scanner_devices_by_address(
         hass, address, connectable=True
     ):
-        # scanner_device.ble_device is the BLEDevice seen by this scanner.
-        # scanner_device.scanner.source identifies the scanner:
-        #   "local"           → the host's built-in Bluetooth adapter (hci0)
-        #   "<MAC address>"   → an ESPHome Bluetooth proxy
         source = getattr(scanner_device.scanner, "source", None) or ""
         device = scanner_device.ble_device
         if device is None:
             continue
-        if source.strip().lower() == "local":
-            if local_device is None:
-                local_device = device
-        else:
-            if proxy_device is None:
-                proxy_device = device
+        if is_proxy_source(hass, source):
+            return device
 
-    if proxy_device is not None:
-        return proxy_device
-    if local_device is not None:
-        _LOGGER.warning(
-            "No ESPHome proxy path found for %s; falling back to local adapter. "
-            "The scale may request a new pairing code if the bond is on a proxy.",
-            address,
-        )
-        return local_device
-    # Last resort: use HA's standard lookup (may be None).
-    return async_ble_device_from_address(hass, address, connectable=True)
+    _LOGGER.debug(
+        "No connectable proxy path found for %s (local adapters like hci* are excluded)",
+        address,
+    )
+    return None
 
 
 _LOCKS = "scale_locks"
@@ -161,14 +200,14 @@ async def async_wait_for_wake(
     after `timeout`.
 
     A sleeping scale doesn't advertise, so any proxy advertisement means it is
-    awake.  Advertisements arriving only via the local adapter are ignored so
-    that the scale's bond on the proxy is not disturbed by a local connection.
+    awake. Advertisements arriving via local adapters (hci*, local, usb) are
+    ignored so that the scale's bond on the proxy is not disturbed.
     """
     woke: asyncio.Future[None] = hass.loop.create_future()
 
     @callback
     def on_advertisement(info: BluetoothServiceInfoBleak) -> None:
-        if not woke.done() and not _is_local_adapter(info):
+        if not woke.done() and is_proxy_source(hass, info.source):
             woke.set_result(None)
 
     @callback
@@ -207,29 +246,32 @@ async def async_open_session(
     session_timeout: float | None = None,
     deadline: float | None = None,
 ) -> AsyncIterator[ScaleSession]:
-    """Connect to an awake scale through any connectable path; always disconnect.
+    """Connect to an awake scale through an authorized proxy path; always disconnect.
 
-    Pass `device` from a connectable advertisement that is being handled right
-    now: HA hasn't recorded it yet. `session_timeout` replaces the default budget
-    that fits the wake window, for sessions that keep the scale awake (teaching).
-    `deadline` (event loop time) ends the session earlier, for work that starts
-    late in a wake.
+    Pass `device` from a connectable proxy advertisement that is being handled right
+    now. If device came from a local adapter (hci*, local, usb), it is rejected
+    and a proxy path is resolved instead.
 
-    A failed bond (a stale one after a factory reset) is cleared on the proxy
-    and the connect repeated once (#23).
+    For the SBF77, automatic unpairing on failed connection is disabled so that
+    a transient connection error cannot wipe the manual passkey bond on the ESP.
     """
-    if device is None:
+    if device is None or is_local_source(hass, _device_source(device)):
         device = async_ble_device_for_scale(hass, address)
     if device is None:
-        raise ScaleConnectionError(f"no connectable Bluetooth path to {address}")
+        raise ScaleConnectionError(f"no connectable proxy path to {address}")
     opened = False
     try:
+        remove_bond = (
+            None
+            if model.name == "SBF77"
+            else partial(async_remove_bond, hass, device)
+        )
         async with open_session(
             device,
             model,
             session_timeout=session_timeout,
             deadline=deadline,
-            remove_bond=partial(async_remove_bond, hass, device),
+            remove_bond=remove_bond,
         ) as session:
             opened = True
             yield session
